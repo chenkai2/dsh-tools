@@ -16,12 +16,9 @@
  * Usage:
  *   node dsh-fix-empty-tool-names.mjs <session-dir-or-log> [--dry-run|--apply] [--json|--help]
  */
-import { spawn } from 'node:child_process'
 import { copyFile, rename, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
-
-const REPO = process.env.DSH_CHECKOUT ?? '/Users/chenkai2/data1/www/htdocs/deepseek-harness'
-const { compressZstdFrame } = await import(REPO + '/packages/session/session-persistence-jsonl/lib/types/zstd.js')
+import { encodeFramedLog, readLogText } from './lib/zstd.mjs'
 
 const args = process.argv.slice(2)
 const apply = args.includes('--apply')
@@ -64,7 +61,7 @@ async function resolveLog(path) {
   return join(path, candidates.at(-1))
 }
 
-/** Decompress (if needed) and parse one line, returning [text, value]. */
+/** Decompress (if needed) and parse one line into a JSON value. */
 function parseLine(line) {
   if (line.length === 0) return undefined
   try { return JSON.parse(line) } catch { return undefined }
@@ -72,19 +69,7 @@ function parseLine(line) {
 
 const logPath = await resolveLog(target)
 const compressed = logPath.endsWith('.zstd')
-
-/** Read the whole log as text (one JSONL row per line). */
-async function readText() {
-  const child = compressed
-    ? spawn('zstd', ['-dc', logPath], { stdio: ['ignore', 'pipe', 'inherit'] })
-    : spawn('cat', [logPath], { stdio: ['ignore', 'pipe', 'inherit'] })
-  const chunks = []
-  for await (const chunk of child.stdout) chunks.push(chunk)
-  await new Promise(resolve => child.on('close', resolve))
-  return Buffer.concat(chunks).toString('utf8')
-}
-
-const text = await readText()
+const text = await readLogText(logPath)
 const lines = text.split('\n')
 
 // Pass 1: the first non-empty name per call id, taken from the run that produced the call.
@@ -126,7 +111,6 @@ const patchedLines = lines.map(line => {
   let next = line
   const replace = (id, from) => {
     if (typeof id !== 'string' || !recoverableIds.has(id)) return
-    const before = '"name":""'
     const after = '"name":' + JSON.stringify(firstNames.get(id))
     if (!next.includes(from)) return
     next = next.replace(from, after)
@@ -200,16 +184,8 @@ const temporary = join(dirname(logPath), '.' + basename(logPath) + '.repair-tmp'
 
 // The first independently decodable frame must contain exactly one header line
 // (plaintext ends with the single newline); every later frame may hold any complete rows.
-const remainder = patchedLines.slice(1).join('\n')
-
-if (compressed) {
-  const frames = [await compressZstdFrame(Buffer.from((lines[0] ?? '') + '\n', 'utf8'))]
-  for (let offset = 0; offset < remainder.length; offset += 1024 * 1024) {
-    frames.push(await compressZstdFrame(Buffer.from(remainder.slice(offset, offset + 1024 * 1024), 'utf8')))
-  }
-  await writeFile(temporary, Buffer.concat(frames))
-} else {
-  await writeFile(temporary, patchedText, 'utf8')
-}
+await writeFile(temporary, compressed
+  ? await encodeFramedLog(patchedLines)
+  : Buffer.from(patchedText, 'utf8'))
 await rename(temporary, logPath)
 console.log(JSON.stringify({ ...summary, backup }, null, 1))

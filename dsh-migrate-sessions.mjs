@@ -1,109 +1,91 @@
 #!/usr/bin/env node
 /**
- * dsh-migrate-sessions — publish a current (v3) generation for historical JSONL sessions
- * that the released v2->v3 source audit refuses to migrate.
+ * dsh-migrate-sessions — publish a current-format generation for historical JSONL sessions
+ * that a DeepSeek Harness build refuses to open.
  *
- * Why this exists: `MessageSourceMap` is merge-extensible, so plugins may persist their own
- * message source kinds. The released v2->v3 migration edge classifies unknown source kinds as
- * un-migratable and leaves the historical file alone, so such sessions cannot be opened at all.
- * This tool performs the upgrade once, through the shipped persistence backend's own write-open
- * (migration + Worker verification + no-overwrite publication), after which the stock host reads
- * `session.v3.jsonl.*` natively. It never edits or deletes a source generation.
+ * Why this exists: the JSONL persistence backend only reads a stored log by running the
+ * adjacent format migration chain, and a released migration edge refuses anything outside
+ * its audited vocabulary (for example a message `source.kind` written by a plugin). The
+ * refusal leaves the historical file byte-identical, so the Session simply cannot be opened.
+ *
+ * This tool performs the upgrade once, using the published Harness format packages: it
+ * restores the stored log into current logical events, re-encodes them as a current
+ * generation beside the original, and never touches the source file. A host then prefers the
+ * newest generation and reads it natively, so the refusing edge is never reached again.
+ *
+ * The result is the released current format, encoded with the released encoder and framed
+ * exactly like the backend (one header frame, then line-aligned plaintext slices). The
+ * installed package version therefore decides what can be migrated: point `--packages` at a
+ * build that understands your log.
  *
  * Usage:
- *   node dsh-migrate-sessions.mjs [--dry-run] [--root <dir>] [--marker <text>] [--help] [session-dir ...]
- *
- * Requires DSH_CHECKOUT to point at a checkout whose built packages contain the v2->v3 fix for
- * the marker kind (otherwise the publication refuses exactly as the host does).
+ *   node dsh-migrate-sessions.mjs [--dry-run] [--root <dir>] [--packages <dir>]
+ *                                 [--marker <text>] [--help] [session-dir ...]
  *
  * Exit codes: 0 = every planned session published or already current; 1 = at least one failure.
  */
-import { spawn } from 'node:child_process'
-import { once } from 'node:events'
-import { readdir, stat } from 'node:fs/promises'
-import { join } from 'node:path'
-
-const REPO = process.env.DSH_CHECKOUT
-  ?? '/Users/chenkai2/data1/www/htdocs/deepseek-harness'
-const args = process.argv.slice(2)
+import { mkdir, readdir, rm, stat, link, unlink, writeFile } from 'node:fs/promises'
+import { basename, join, resolve } from 'node:path'
+import { resolvePackages } from './lib/packages.mjs'
+import { encodeFramedLog, logLines, readLogText } from './lib/zstd.mjs'
 
 const USAGE = [
-  'usage: dsh-migrate-sessions [--dry-run] [--root <dir>] [--marker <text>] [session-dir ...]',
+  'usage: dsh-migrate-sessions [--dry-run] [--root <dir>] [--packages <dir>] [--marker <text>] [session-dir ...]',
   '',
-  '  --dry-run         classify only; never opens or writes a session',
-  '  --root <dir>      session root (default: $DSH_SESSIONS_ROOT or ~/.dsh/sessions)',
-  '  --marker <text>   source kind that marks a session for repair (default: agent-teams-command)',
-  '  session-dir ...   restrict to these session directories (default: every session under the root)',
+  '  --dry-run        classify only; never opens or writes a session',
+  '  --root <dir>     session root (default: $DSH_SESSIONS_ROOT or ~/.dsh/sessions)',
+  '  --packages <dir> directory whose node_modules holds the published @deepseek-ai packages',
+  '                   (default: $DSH_PACKAGES, then this tools directory)',
+  '  --marker <text>  stored vocabulary that marks a session for repair (default: agent-teams-command)',
+  '  session-dir ...  restrict to these session directories (default: every session under the root)',
   '',
-  'Publishes the current (v3) generation through the host persistence backend; source generations are never modified.',
+  'Publishes the current generation beside a stored log; source generations are never modified.',
 ].join('\n')
+
+const args = process.argv.slice(2)
 if (args.includes('--help')) {
   console.log(USAGE)
   process.exit(0)
 }
+
+/** Read the value that follows one flag, or `undefined`. */
+function flagValue(name) {
+  const index = args.indexOf(name)
+  return index === -1 ? undefined : args[index + 1]
+}
+
 const dryRun = args.includes('--dry-run')
-const rootIndex = args.indexOf('--root')
-const root = rootIndex === -1 ? (process.env.DSH_SESSIONS_ROOT ?? '/Users/chenkai2/.dsh/sessions') : args[rootIndex + 1]
-const markerIndex = args.indexOf('--marker')
-const marker = markerIndex === -1 ? 'agent-teams-command' : args[markerIndex + 1]
+const root = flagValue('--root')
+  ?? process.env['DSH_SESSIONS_ROOT']
+  ?? join(process.env['HOME'] ?? '.', '.dsh', 'sessions')
+const packagesDir = flagValue('--packages')
+const marker = flagValue('--marker') ?? 'agent-teams-command'
 const consumed = new Set()
-if (rootIndex !== -1) consumed.add(rootIndex + 1)
-if (markerIndex !== -1) consumed.add(markerIndex + 1)
+for (const name of ['--root', '--packages', '--marker']) {
+  const index = args.indexOf(name)
+  if (index !== -1) consumed.add(index + 1)
+}
 const only = args.filter((value, index) => !value.startsWith('--') && !consumed.has(index))
 
-const { Context } = await import(REPO + '/vendor/cordis/lib/index.js')
-const { default: JsonlSessionPersistence } = await import(REPO + '/packages/session/session-persistence-jsonl/lib/index.js')
-const { SessionId } = await import(REPO + '/packages/core/session/lib/index.js')
+const GENERATION = /^session(?:\.v([0-9]+))?\.jsonl(\.zstd)?$/
 
-const V3_NAMES = new Set(['session.v3.jsonl', 'session.v3.jsonl.zstd'])
-const HISTORICAL = /^session(?:\.v([0-9]+))?\.jsonl(\.zstd)?$/
+const resolved = await resolvePackages(packagesDir)
+const { sessionFormatCatalog } = await resolved.load('@deepseek-ai/dsh-session-format-catalog')
+const currentVersion = sessionFormatCatalog.currentVersion
 
-/** Spawn one streaming `zstd -dc` reader over a historical log. */
-function stream(path) {
-  return spawn('zstd', ['-dc', path], { stdio: ['ignore', 'pipe', 'ignore'] })
+/** Generation number encoded in one stored filename, or `-1`. */
+function generationOf(name) {
+  const match = GENERATION.exec(name)
+  if (match === null) return -1
+  return match[1] === undefined ? 0 : Number(match[1])
 }
 
-/** Read only the leading physical header row. */
-function readHeaderRow(path) {
-  return new Promise((resolve, reject) => {
-    const child = stream(path)
-    let buffer = ''
-    child.stdout.setEncoding('utf8')
-    child.stdout.on('data', chunk => {
-      buffer += chunk
-      const end = buffer.indexOf('\n')
-      if (end !== -1) {
-        child.kill('SIGKILL')
-        resolve(JSON.parse(buffer.slice(0, end)))
-      }
-    })
-    child.on('error', reject)
-    child.on('close', () => {
-      if (buffer.length === 0) return
-      try { resolve(JSON.parse(buffer)) } catch (error) { reject(error) }
-    })
-  })
+/** Current-generation filename matching a stored log's compression. */
+function currentName(compressed) {
+  return `session.v${String(currentVersion)}.jsonl${compressed ? '.zstd' : ''}`
 }
 
-/** Whether this log still carries the source kind the repair exists for, without full decompression. */
-async function needsRepair(path) {
-  const child = stream(path)
-  const needle = Buffer.from(marker, 'utf8')
-  let carry = Buffer.alloc(0)
-  try {
-    for await (const chunk of child.stdout) {
-      const window = carry.length === 0 ? chunk : Buffer.concat([carry, chunk])
-      if (window.includes(needle)) return true
-      carry = window.subarray(Math.max(0, window.length - needle.length))
-    }
-    return false
-  } finally {
-    child.kill('SIGKILL')
-    await once(child, 'close').catch(() => {})
-  }
-}
-
-/** Every session directory beneath the root, regardless of project key. */
+/** Every session directory beneath the root. */
 async function sessionDirs() {
   const dirs = []
   for (const project of await readdir(root, { withFileTypes: true })) {
@@ -116,59 +98,113 @@ async function sessionDirs() {
   return dirs
 }
 
-/** Plan one session directory, or `undefined` when it needs no v3 publication. */
-async function plan(directory) {
-  const entries = await readdir(directory)
-  const current = entries.filter(name => V3_NAMES.has(name))
-  const historical = entries.filter(name => HISTORICAL.test(name) && !V3_NAMES.has(name))
-  if (historical.length === 0) return undefined
-  if (current.length > 0) return { directory, skip: 'already has a v3 generation' }
-  const version = name => {
-    const match = HISTORICAL.exec(name)
-    return match?.[1] === undefined ? 0 : Number(match[1])
+/** Whether a stored log still carries the marker vocabulary. */
+async function hasMarker(path) {
+  for await (const line of logLines(path)) {
+    if (line.includes(marker)) return true
   }
-  historical.sort((a, b) => version(a) - version(b))
-  const source = join(directory, historical.at(-1))
-  if (!await needsRepair(source)) return undefined
-  const header = await readHeaderRow(source)
-  return { directory, source, id: header.id, version: versionOf(historical.at(-1)) }
-  function versionOf(name) { return version(name) }
+  return false
+}
+
+/** First JSONL record of a stored log. */
+async function readHeaderRow(path) {
+  const text = await readLogText(path)
+  const end = text.indexOf('\n')
+  return JSON.parse(end === -1 ? text : text.slice(0, end))
+}
+
+/** One session directory's plan, or `undefined` when it needs no publication. */
+async function planSession(directory) {
+  const entries = await readdir(directory)
+  const stored = entries.filter(name => generationOf(name) >= 0)
+  if (stored.length === 0) return undefined
+  const current = entries.filter(name => name === currentName(true) || name === currentName(false))
+  const historical = stored
+    .filter(name => generationOf(name) < currentVersion)
+    .sort((left, right) => generationOf(left) - generationOf(right))
+  if (historical.length === 0) {
+    const newest = stored.map(generationOf).sort((left, right) => right - left)[0]
+    return { directory, skip: `already reads as v${String(newest)}` }
+  }
+  if (current.length > 0) return { directory, skip: `already has ${current[0]}` }
+  const source = historical.at(-1)
+  const sourcePath = join(directory, source)
+  if (!(await hasMarker(sourcePath))) return undefined
+  const header = await readHeaderRow(sourcePath)
+  return { directory, source, sourcePath, id: header.id, version: generationOf(source) }
+}
+
+/** Restore a stored log into the current logical artifact. */
+async function restoreArtifact(sourcePath, header) {
+  const restore = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation: 'transformed' })
+  let rows = 0
+  for await (const line of logLines(sourcePath)) {
+    rows += 1
+    if (rows === 1) continue
+    restore.decodeRow(JSON.parse(line))
+  }
+  return restore.finish()
+}
+
+/** Publish the current generation beside a stored log. */
+async function publish(candidate) {
+  const header = await readHeaderRow(candidate.sourcePath)
+  const artifact = await restoreArtifact(candidate.sourcePath, header)
+  const compressed = candidate.sourcePath.endsWith('.zstd')
+  const rows = [sessionFormatCatalog.encodeCurrentHeader(artifact.header, artifact.inheritedEventCount)]
+  for (const event of artifact.events) rows.push(sessionFormatCatalog.encodeCurrentEvent(event))
+  const name = currentName(compressed)
+  const target = join(candidate.directory, name)
+  const bytes = compressed
+    ? await encodeFramedLog(rows)
+    : Buffer.from(rows.map(row => JSON.stringify(row)).join('\n'), 'utf8')
+  await mkdir(candidate.directory, { recursive: true })
+  const staging = join(candidate.directory, `.${basename(target)}.staging`)
+  await writeFile(staging, bytes)
+  try {
+    // Publication never overwrites: a concurrent writer wins and we discard our staging file.
+    await link(staging, target)
+  } catch (error) {
+    if (error?.code === 'EEXIST') return { target, name, skipped: true }
+    throw error
+  } finally {
+    await unlink(staging).catch(() => {})
+  }
+  return { target, name, skipped: false }
 }
 
 const directories = only.length > 0 ? only : await sessionDirs()
 const plans = []
 for (const directory of directories) {
-  const candidate = await plan(directory.startsWith('/') ? directory : join(root, directory))
+  const candidate = await planSession(resolve(directory.startsWith('/') ? directory : join(root, directory)))
   if (candidate !== undefined) plans.push(candidate)
 }
 
-const context = new Context()
-await context.plugin(JsonlSessionPersistence, { root, compression: 'zstd' })
+console.log(`packages: ${resolved.base}`)
+console.log(`root: ${root}`)
+console.log(`current format: v${String(currentVersion)}\n`)
+
 let migrated = 0
 let failed = 0
 for (const candidate of plans) {
   if (candidate.skip !== undefined) {
-    console.log('SKIP  ' + candidate.directory + ' — ' + candidate.skip)
+    console.log(`SKIP  ${candidate.directory} — ${candidate.skip}`)
     continue
   }
-  const label = candidate.id + ' (v' + String(candidate.version) + ')'
+  const label = `${candidate.id} (v${String(candidate.version)})`
   if (dryRun) {
-    console.log('PLAN  ' + label + '  ' + candidate.source)
+    console.log(`PLAN  ${label}  ${candidate.sourcePath}`)
     continue
   }
   try {
-    const handle = await context.sessionPersistence.open(SessionId(candidate.id), 'write')
-    await handle.close()
-    const published = join(candidate.directory, 'session.v3.jsonl.zstd')
-    const identity = await stat(published).catch(() => undefined)
+    const result = await publish(candidate)
+    const size = (await stat(result.target)).size
     migrated += 1
-    console.log('OK    ' + label + ' -> session.v3.jsonl.zstd'
-      + (identity === undefined ? '' : ' (' + String(identity.size) + ' bytes)'))
+    console.log(`OK    ${label} -> ${result.name}${result.skipped ? ' (already published)' : ` (${String(size)} bytes)`}`)
   } catch (error) {
     failed += 1
-    console.log('FAIL  ' + label + ': ' + (error?.constructor?.name ?? 'Error') + ' - ' + (error?.message ?? String(error)))
+    console.log(`FAIL  ${label}: ${error?.constructor?.name ?? 'Error'} - ${error?.message ?? String(error)}`)
   }
 }
-await context.fiber.dispose()
-console.log('\nplanned ' + String(plans.length) + '; migrated ' + String(migrated) + '; failed ' + String(failed))
+console.log(`\nplanned ${String(plans.length)}; migrated ${String(migrated)}; failed ${String(failed)}`)
 if (failed > 0) process.exitCode = 1
